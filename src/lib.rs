@@ -11,6 +11,7 @@ mod stage;
 mod distributed_planner;
 mod networking;
 mod protobuf;
+pub mod luxdb;
 #[cfg(any(feature = "integration", feature = "luxdb_integration", test))]
 pub mod test_utils;
 

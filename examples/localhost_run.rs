@@ -7,14 +7,13 @@ use datafusion_distributed::{
     DistributedExt, DistributedPhysicalOptimizerRule, TaskEstimation, TaskEstimator, WorkerResolver,
     display_plan_ascii,
 };
-use datafusion_proto::physical_plan::PhysicalExtensionCodec;
 use futures::TryStreamExt;
 use std::error::Error;
 use std::sync::Arc;
 use structopt::StructOpt;
 use url::Url;
 
-mod luxdb_table;
+use datafusion_distributed::luxdb;
 
 #[derive(StructOpt)]
 #[structopt(name = "run", about = "A localhost Distributed DataFusion runner")]
@@ -90,7 +89,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .with_distributed_task_estimator(LuxSegmentsTaskEstimator {
             desired_tasks: args.lux_partitions,
         })
-        .with_distributed_user_codec(luxdb_table::LuxSegmentsCodec)
+        .with_distributed_user_codec(luxdb::segments::LuxSegmentsCodec)
         .build();
 
     let ctx = SessionContext::from(state);
@@ -98,7 +97,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // Register LuxDB segments table on the driver side (for SQL planning).
     ctx.register_table(
         "lux_segments",
-        Arc::new(luxdb_table::LuxSegmentsTableProvider::new_multi(
+        Arc::new(luxdb::LuxSegmentsTableProvider::new_multi(
             args.lux_segments_dirs,
             args.lux_partitions,
         )),

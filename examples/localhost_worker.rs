@@ -1,13 +1,12 @@
 use datafusion::execution::context::SessionContext;
 use datafusion_distributed::{DistributedExt, Worker, WorkerQueryContext};
-use datafusion_proto::physical_plan::PhysicalExtensionCodec;
 use std::error::Error;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use structopt::StructOpt;
 use tonic::transport::Server;
 
-mod luxdb_table;
+use datafusion_distributed::luxdb;
 
 #[derive(StructOpt)]
 #[structopt(name = "localhost_worker", about = "A localhost DataFusion worker")]
@@ -43,13 +42,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
             // We build a SessionContext from it to register our table.
             let state = ctx
                 .builder
-                .with_distributed_user_codec(luxdb_table::LuxSegmentsCodec)
+                .with_distributed_user_codec(luxdb::segments::LuxSegmentsCodec)
                 .build();
             let session_ctx = SessionContext::new_with_state(state);
 
             session_ctx.register_table(
                 "lux_segments",
-                Arc::new(luxdb_table::LuxSegmentsTableProvider::new_multi(
+                Arc::new(luxdb::LuxSegmentsTableProvider::new_multi(
                     segments_dirs,
                     partitions,
                 )),
