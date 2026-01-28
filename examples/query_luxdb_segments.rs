@@ -8,6 +8,7 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::Session;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
+use datafusion::execution::SessionStateBuilder;
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_expr::EquivalenceProperties;
@@ -17,28 +18,43 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
     SendableRecordBatchStream, Statistics,
 };
+use datafusion_distributed::{
+    DistributedExt, DistributedPhysicalOptimizerRule, display_plan_ascii,
+};
 use luxdb::storage::engine::SegmentReader;
+
+const SEGMENTS_DIR: &str =
+    "/Users/admin/datafusion-distributed/generated_data/demo_db/shard_0/segments";
+
+const WORKER_COUNT: usize = 3;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let shard_segments_dir =
-        "/Users/admin/datafusion-distributed/generated_data/demo_db/shard_0/segments";
+    let state = SessionStateBuilder::new()
+        .with_default_features()
+        .with_physical_optimizer_rule(Arc::new(DistributedPhysicalOptimizerRule))
+        .with_distributed_worker_resolver(datafusion_distributed::test_utils::in_memory_channel_resolver::InMemoryWorkerResolver::new(WORKER_COUNT))
+        .with_distributed_channel_resolver(datafusion_distributed::test_utils::in_memory_channel_resolver::InMemoryChannelResolver::default())
+        .build();
 
-    let ctx = SessionContext::new();
+    let ctx = SessionContext::from(state);
 
-    let provider = Arc::new(LuxSegmentsTableProvider::new(shard_segments_dir.to_string()));
+    let provider = Arc::new(LuxSegmentsTableProvider::new(SEGMENTS_DIR.to_string()));
     ctx.register_table("lux_segments", provider)?;
 
-    let df = ctx
-        .sql(
-            "SELECT metric, tags, series_id, timestamp, fields \
-             FROM lux_segments \
-             ORDER BY timestamp \
-             LIMIT 20",
-        )
-        .await?;
+    let sql = "SELECT metric, tags, series_id, timestamp, fields \
+               FROM lux_segments \
+               ORDER BY timestamp \
+               LIMIT 20";
 
-    df.show().await?;
+    let df = ctx.sql(sql).await?;
+
+    // 1) 打印“分布式物理计划”（如果 optimizer 能插入分布式算子，会在这里看到）
+    let plan = df.create_physical_plan().await?;
+    println!("{}", display_plan_ascii(plan.as_ref(), false));
+
+    // 2) 实际执行（可选：你也可以注释掉，只看计划）
+    // df.show().await?;
 
     Ok(())
 }
@@ -95,11 +111,14 @@ impl TableProvider for LuxSegmentsTableProvider {
         _filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        // 关键：让 Scan 有 >=3 个 partitions，这样分布式 rule 才有机会把 partitions
+        // 分发给不同 worker。
         Ok(Arc::new(LuxSegmentsExec::new(
             Self::schema_ref(),
             self.segments_dir.clone(),
             projection.cloned(),
             limit,
+            WORKER_COUNT,
         )))
     }
 }
@@ -110,6 +129,7 @@ struct LuxSegmentsExec {
     segments_dir: String,
     projection: Option<Vec<usize>>,
     limit: Option<usize>,
+    partition_count: usize,
     properties: PlanProperties,
 }
 
@@ -119,11 +139,12 @@ impl LuxSegmentsExec {
         segments_dir: String,
         projection: Option<Vec<usize>>,
         limit: Option<usize>,
+        partition_count: usize,
     ) -> Self {
         let eq_properties = EquivalenceProperties::new(schema.clone());
         let properties = PlanProperties::new(
             eq_properties,
-            Partitioning::UnknownPartitioning(1),
+            Partitioning::UnknownPartitioning(partition_count),
             EmissionType::Final,
             Boundedness::Bounded,
         );
@@ -133,28 +154,33 @@ impl LuxSegmentsExec {
             segments_dir,
             projection,
             limit,
+            partition_count,
             properties,
         }
     }
 
-    fn load_batches(&self) -> anyhow::Result<Vec<RecordBatch>> {
+    fn load_partition_batch(&self, partition: usize) -> anyhow::Result<RecordBatch> {
         let mut rows_metric: Vec<String> = Vec::new();
         let mut rows_tags: Vec<Option<String>> = Vec::new();
         let mut rows_series_id: Vec<u32> = Vec::new();
         let mut rows_timestamp: Vec<i64> = Vec::new();
         let mut rows_fields: Vec<Option<String>> = Vec::new();
 
-        let entries = std::fs::read_dir(&self.segments_dir)
-            .with_context(|| format!("read_dir failed: {}", self.segments_dir))?;
+        let mut entries: Vec<_> = std::fs::read_dir(&self.segments_dir)
+            .with_context(|| format!("read_dir failed: {}", self.segments_dir))?
+            .flatten()
+            .collect();
 
-        for entry in entries {
-            let entry = entry?;
+        // 使分区稳定：按文件名排序
+        entries.sort_by_key(|e| e.file_name());
+
+        for (idx, entry) in entries.into_iter().enumerate() {
+            if idx % self.partition_count != partition {
+                continue;
+            }
+
             let path = entry.path();
-            if !path
-                .extension()
-                .map(|e| e == "seg")
-                .unwrap_or(false)
-            {
+            if !path.extension().map(|e| e == "seg").unwrap_or(false) {
                 continue;
             }
 
@@ -248,10 +274,8 @@ impl LuxSegmentsExec {
             self.schema.clone()
         };
 
-        let batch = RecordBatch::try_new(projected_schema, projected_arrays)
-            .map_err(|e| anyhow::anyhow!(e))?;
-
-        Ok(vec![batch])
+        Ok(RecordBatch::try_new(projected_schema, projected_arrays)
+            .map_err(|e| anyhow::anyhow!(e))?)
     }
 }
 
@@ -283,18 +307,18 @@ impl ExecutionPlan for LuxSegmentsExec {
 
     fn execute(
         &self,
-        _partition: usize,
+        partition: usize,
         _context: Arc<datafusion::execution::TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
-        let batches = self
-            .load_batches()
-            .map_err(|e| DataFusionError::Execution(format!("load luxdb segments failed: {e}")))?;
+        let batch = self.load_partition_batch(partition).map_err(|e| {
+            DataFusionError::Execution(format!(
+                "load luxdb segments failed (partition={partition}): {e}"
+            ))
+        })?;
 
         let schema = self.schema();
         let stream = Box::pin(async_stream::stream! {
-            for batch in batches {
-                yield Ok(batch);
-            }
+            yield Ok(batch);
         });
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
