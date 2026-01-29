@@ -17,7 +17,7 @@ use datafusion::physical_plan::{
     SendableRecordBatchStream, Statistics,
 };
 use datafusion_proto::physical_plan::PhysicalExtensionCodec;
-use luxdb::storage::engine::SegmentReader;
+use luxdb::storage::segment::SegmentReader;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -228,7 +228,8 @@ impl TableProvider for LuxSegmentsTableProvider {
 
 #[derive(Debug, Clone)]
 pub struct LuxSegmentsExec {
-    pub schema: SchemaRef,
+    pub input_schema: SchemaRef,
+    pub output_schema: SchemaRef,
     pub tasks: Vec<PrunedScanTask>,
     pub projection: Option<Vec<usize>>,
     pub limit: Option<usize>,
@@ -238,13 +239,20 @@ pub struct LuxSegmentsExec {
 
 impl LuxSegmentsExec {
     pub fn new(
-        schema: SchemaRef,
+        input_schema: SchemaRef,
         tasks: Vec<PrunedScanTask>,
         projection: Option<Vec<usize>>,
         limit: Option<usize>,
         partition_count: usize,
     ) -> Self {
-        let eq_properties = EquivalenceProperties::new(schema.clone());
+        let output_schema: SchemaRef = if let Some(ref proj) = projection {
+            let fields: Vec<Field> = proj.iter().map(|i| input_schema.field(*i).clone()).collect();
+            Arc::new(Schema::new(fields))
+        } else {
+            input_schema.clone()
+        };
+
+        let eq_properties = EquivalenceProperties::new(output_schema.clone());
         let properties = PlanProperties::new(
             eq_properties,
             Partitioning::UnknownPartitioning(partition_count),
@@ -253,7 +261,8 @@ impl LuxSegmentsExec {
         );
 
         Self {
-            schema,
+            input_schema,
+            output_schema,
             tasks,
             projection,
             limit,
@@ -416,21 +425,14 @@ impl LuxSegmentsExec {
             arrays
         };
 
-        let projected_schema: SchemaRef = if let Some(ref proj) = self.projection {
-            let fields: Vec<Field> = proj.iter().map(|i| self.schema.field(*i).clone()).collect();
-            Arc::new(Schema::new(fields))
-        } else {
-            self.schema.clone()
-        };
-
-        Ok(RecordBatch::try_new(projected_schema, projected_arrays)
+        Ok(RecordBatch::try_new(self.output_schema.clone(), projected_arrays)
             .map_err(|e| anyhow::anyhow!(e))?)
     }
 }
 
 impl DisplayAs for LuxSegmentsExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        let preview_n = 2usize;
+        let preview_n = 3usize;
         let mut items = Vec::new();
         for (i, t) in self.tasks.iter().take(preview_n).enumerate() {
             let file_name = std::path::Path::new(&t.seg_path)
@@ -442,7 +444,7 @@ impl DisplayAs for LuxSegmentsExec {
                 Some((a, b)) => format!(" time=[{a},{b}]"),
             };
             let blk = match &t.blocks {
-                None => " blocks=ALL".to_string(),
+                None => " series_blocks=ALL".to_string(),
                 Some(v) => {
                     let ids_preview: Vec<String> = v
                         .iter()
@@ -450,7 +452,7 @@ impl DisplayAs for LuxSegmentsExec {
                         .map(|b| format!("{}", b.series_id))
                         .collect();
                     let extra = if v.len() > 3 { ";..." } else { "" };
-                    format!(" blocks={} ids=[{}{}]", v.len(), ids_preview.join(","), extra)
+                    format!(" series_blocks={} ids=[{}{}]", v.len(), ids_preview.join(","), extra)
                 }
             };
             items.push(format!("#{} {}{}{}", i, file_name, tr, blk));
@@ -477,7 +479,7 @@ impl ExecutionPlan for LuxSegmentsExec {
     }
 
     fn schema(&self) -> SchemaRef {
-        self.schema.clone()
+        self.output_schema.clone()
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -511,7 +513,7 @@ impl ExecutionPlan for LuxSegmentsExec {
     }
 
     fn statistics(&self) -> DataFusionResult<Statistics> {
-        Ok(Statistics::new_unknown(&self.schema))
+        Ok(Statistics::new_unknown(&self.output_schema))
     }
 
     fn name(&self) -> &str {
